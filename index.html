@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+    <title>ArcGIS 3D 半透明建物圖台 (自動整地版)</title>
+    <link rel="stylesheet" href="https://js.arcgis.com/4.28/esri/themes/light/main.css" />
+    <script src="https://js.arcgis.com/4.28/"></script>
+    <style>
+        html, body, #viewDiv {
+            padding: 0; margin: 0; height: 100%; width: 100%; background-color: #f4f4f4;
+        }
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            font-size: 1.2rem; font-family: sans-serif; background: rgba(255,255,255,0.9);
+            padding: 15px 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 10;
+        }
+        #controlPanel {
+            background: white; padding: 15px; border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15); font-family: sans-serif;
+            width: 320px; display: none; max-height: 80vh; overflow-y: auto;
+        }
+        .control-group { margin-bottom: 15px; padding-bottom: 15px; border-bottom: 1px solid #eee; }
+        .control-group:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+        button {
+            width: 100%; padding: 8px; background: #0079c1; color: white; border: none;
+            border-radius: 4px; cursor: pointer; font-size: 14px;
+        }
+        button:hover { background: #005a92; }
+        button.delete-btn { background: #d9534f; padding: 4px 8px; margin: 0; width: auto; }
+        button.delete-btn:hover { background: #c9302c; }
+        .info-text { font-size: 13px; color: #555; margin-bottom: 5px; }
+        input[type="range"] { width: 100%; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+        th, td { border: 1px solid #ddd; padding: 6px; text-align: center; word-break: break-all; }
+        th { background-color: #f8f8f8; }
+        
+        .mode-panel {
+            background-color: #f8f9fa; border: 1px solid #dee2e6;
+            padding: 12px; border-radius: 6px; margin-bottom: 15px;
+        }
+        .mode-label {
+            display: block; margin: 8px 0; cursor: pointer; font-size: 14px; font-weight: bold; color: #333;
+        }
+        .mode-label input { margin-right: 8px; transform: scale(1.2); }
+    </style>
+</head>
+<body>
+    <div id="loading">⏳ 3D 建物模型載入中，請稍候...</div>
+    <div id="viewDiv"></div>
+    
+    <div id="controlPanel">
+        <div class="mode-panel">
+            <div class="info-text" style="color: #0056b3; margin-bottom: 8px;"><b>🖱️ 滑鼠點擊模式切換：</b></div>
+            <label class="mode-label">
+                <input type="radio" name="mouseMode" value="browse" checked> 🌍 1. 瀏覽地圖與建物資訊
+            </label>
+            <label class="mode-label">
+                <input type="radio" name="mouseMode" value="pick"> 🎯 2. 選取座標 (打點用)
+            </label>
+            <label class="mode-label">
+                <input type="radio" name="mouseMode" value="query"> 🔴 3. 強制查詢紅點
+            </label>
+        </div>
+
+        <div class="control-group">
+            <div class="info-text">模型透明度: <span id="opacityValue">40</span>%</div>
+            <input type="range" id="opacitySlider" min="0" max="100" value="40">
+        </div>
+
+        <div class="control-group">
+            <div class="info-text"><b>📍 準備產生新點位：</b></div>
+            <div class="info-text" style="color: #666;">(請先切換至「模式2」選取座標)</div>
+            <div class="info-text" style="margin-top: 5px;">X: <span id="valX" style="color:#0079c1; font-weight:bold;">無</span></div>
+            <div class="info-text">Y: <span id="valY" style="color:#0079c1; font-weight:bold;">無</span></div>
+            <div class="info-text" style="margin-top: 10px;">調整高度 (Z): <span id="valZ" style="font-weight:bold;">0</span> 公尺</div>
+            <input type="range" id="zSlider" min="-50" max="500" value="0">
+            <button id="btnGeneratePoint" style="margin-top: 10px;">➕ 產生點座標</button>
+        </div>
+
+        <div class="control-group">
+            <div class="info-text"><b>📋 紀錄點位</b></div>
+            <table id="pointTable">
+                <thead>
+                    <tr><th width="30%">X</th><th width="30%">Y</th><th width="20%">Z</th><th width="20%">操作</th></tr>
+                </thead>
+                <tbody id="tableBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        require([
+            "esri/Map", "esri/views/SceneView", "esri/layers/SceneLayer",
+            "esri/layers/GraphicsLayer", "esri/Graphic", "esri/geometry/Point"
+        ], function(Map, SceneView, SceneLayer, GraphicsLayer, Graphic, Point) {
+
+            const map = new Map({ basemap: "satellite", ground: "world-elevation" });
+            
+            // 【新增】允許視角穿透地表，避免山坡地形碰撞卡頓與破面
+            map.ground.navigationConstraint = { mode: "none" };
+
+            const view = new SceneView({
+                container: "viewDiv", map: map,
+                camera: { position: { x: 120.68, y: 24.14, z: 2500 }, tilt: 60 }
+            });
+
+            view.popup.autoOpenEnabled = true;
+
+            // --- 1. 建物圖層 ---
+            const buildingLayer = new SceneLayer({
+                url: "https://i3s.nlsc.gov.tw/building/i3s/SceneServer/layers/4",
+                outFields: ["*"],
+                opacity: 0.4,
+                popupEnabled: true,
+                // 【新增】強制將建物模型底面錨定在地表上
+                elevationInfo: {
+                    mode: "on-the-ground"
+                },
+                popupTemplate: {
+                    title: "🏢 建物模型資訊",
+                    content: "{*}"
+                },
+                renderer: {
+                    type: "simple",
+                    symbol: {
+                        type: "mesh-3d",
+                        symbolLayers: [{
+                            type: "fill", material: { color: "white" },
+                            edges: { type: "solid", color: [50, 50, 50, 0.5], size: 1 }
+                        }]
+                    }
+                }
+            });
+            map.add(buildingLayer);
+
+            // --- 2. 打點專用的紅點圖層 ---
+            const graphicsLayer = new GraphicsLayer({ elevationInfo: { mode: "absolute-height" } });
+            map.add(graphicsLayer);
+
+            // --- 3. 自動整地基座圖層 【新增】 ---
+            const autoFlattenLayer = new GraphicsLayer({
+                elevationInfo: { mode: "on-the-ground" }
+            });
+            map.add(autoFlattenLayer);
+
+            view.whenLayerView(buildingLayer).then(() => {
+                document.getElementById("loading").style.display = "none";
+                document.getElementById("controlPanel").style.display = "block";
+                view.ui.add("controlPanel", "top-right");
+            });
+
+            // ==========================================
+            // ⭐️ 全自動整地邏輯 (瀏覽時觸發)
+            // ==========================================
+            view.watch("stationary", function(isStationary) {
+                // 只有在鏡頭停止且為瀏覽模式時，才自動鋪設基台
+                const currentMode = document.querySelector('input[name="mouseMode"]:checked').value;
+                if (isStationary && currentMode === "browse") {
+                    
+                    // 偵測畫面中心是否有建物
+                    view.hitTest(view.center).then(function(response) {
+                        autoFlattenLayer.removeAll(); // 清除前一個視角的基座
+                        
+                        const hit = response.results.find(r => r.graphic && r.graphic.layer === buildingLayer);
+                        if (hit && hit.mapPoint) {
+                            const pt = hit.mapPoint;
+                            const delta = 0.0004; // 擴展約 40 公尺產生平坦基座
+
+                            const flatPad = new Graphic({
+                                geometry: {
+                                    type: "polygon",
+                                    rings: [
+                                        [
+                                            [pt.longitude - delta, pt.latitude - delta],
+                                            [pt.longitude + delta, pt.latitude - delta],
+                                            [pt.longitude + delta, pt.latitude + delta],
+                                            [pt.longitude - delta, pt.latitude + delta],
+                                            [pt.longitude - delta, pt.latitude - delta]
+                                        ]
+                                    ],
+                                    spatialReference: { wkid: 4326 }
+                                },
+                                symbol: {
+                                    type: "polygon-3d",
+                                    symbolLayers: [{
+                                        type: "extrude", // 向上長厚度填補山坡空隙
+                                        size: 4, 
+                                        material: { color: [200, 200, 200, 0.7] }, // 半透明水泥色基台
+                                        edges: { type: "solid", color: [100, 100, 100], size: 1 }
+                                    }]
+                                }
+                            });
+                            autoFlattenLayer.add(flatPad);
+                        }
+                    });
+                } else if (!isStationary) {
+                    // 鏡頭移動中可以選擇清空，減少畫面負擔
+                    autoFlattenLayer.removeAll();
+                }
+            });
+
+            // --- UI 邏輯 ---
+            let currentX = null;
+            let currentY = null;
+            let currentGraphicId = 0;
+
+            const spanX = document.getElementById("valX");
+            const spanY = document.getElementById("valY");
+            const spanZ = document.getElementById("valZ");
+            const zSlider = document.getElementById("zSlider");
+            const opacitySlider = document.getElementById("opacitySlider");
+            const opacityValueSpan = document.getElementById("opacityValue");
+            const btnGenerate = document.getElementById("btnGeneratePoint");
+            const tableBody = document.getElementById("tableBody");
+
+            opacitySlider.addEventListener("input", function() {
+                opacityValueSpan.innerText = this.value;
+                buildingLayer.opacity = this.value / 100;
+            });
+
+            zSlider.addEventListener("input", function() { spanZ.innerText = this.value; });
+
+            btnGenerate.addEventListener("click", function() {
+                if (currentX === null || currentY === null) { 
+                    alert("請先將模式切換為「2. 選取座標」，並在地圖上點擊取得位置！"); 
+                    return; 
+                }
+                const currentZ = parseFloat(zSlider.value);
+                const pointId = "pt_" + currentGraphicId++;
+
+                const pointGraphic = new Graphic({
+                    geometry: new Point({
+                        x: parseFloat(currentX), y: parseFloat(currentY), z: currentZ,
+                        spatialReference: view.spatialReference
+                    }),
+                    symbol: {
+                        type: "point-3d",
+                        symbolLayers: [{
+                            type: "object", width: 2, height: 2, depth: 2,
+                            resource: { primitive: "sphere" }, material: { color: "red" }
+                        }]
+                    },
+                    attributes: { id: pointId, x: currentX, y: currentY, z: currentZ }
+                });
+
+                graphicsLayer.add(pointGraphic);
+
+                const tr = document.createElement("tr");
+                tr.id = "row_" + pointId;
+                tr.innerHTML = `<td>${currentX}</td><td>${currentY}</td><td>${currentZ}</td><td><button class="delete-btn" onclick="deletePoint('${pointId}')">刪除</button></td>`;
+                tableBody.appendChild(tr);
+            });
+
+            window.deletePoint = function(pointId) {
+                const row = document.getElementById("row_" + pointId);
+                if (row) row.remove();
+                const g = graphicsLayer.graphics.find(g => g.attributes && g.attributes.id === pointId);
+                if (g) graphicsLayer.remove(g);
+                view.popup.close();
+            };
+
+            const modeRadios = document.querySelectorAll('input[name="mouseMode"]');
+            modeRadios.forEach(radio => {
+                radio.addEventListener('change', function() {
+                    view.popup.close(); 
+                    if (this.value === 'browse') {
+                        document.getElementById("viewDiv").style.cursor = "default";
+                        view.popup.autoOpenEnabled = true;   
+                        buildingLayer.popupEnabled = true;   
+                    } else {
+                        if (this.value === 'pick') {
+                            document.getElementById("viewDiv").style.cursor = "crosshair";
+                        } else if (this.value === 'query') {
+                            document.getElementById("viewDiv").style.cursor = "help";      
+                        }
+                        view.popup.autoOpenEnabled = false;  
+                        buildingLayer.popupEnabled = false;  
+                    }
+                });
+            });
+
+            view.on("click", function(event) {
+                const currentMode = document.querySelector('input[name="mouseMode"]:checked').value;
+
+                if (currentMode === "browse") {
+                    return; 
+                }
+
+                if (currentMode === "pick") {
+                    event.stopPropagation(); 
+                    currentX = event.mapPoint.x.toFixed(2);
+                    currentY = event.mapPoint.y.toFixed(2);
+                    spanX.innerText = currentX; 
+                    spanY.innerText = currentY;
+                    return; 
+                }
+
+                if (currentMode === "query") {
+                    event.stopPropagation(); 
+                    view.popup.close();
+
+                    let closestGraphic = null;
+                    let minDistance = 30; 
+
+                    graphicsLayer.graphics.forEach(function(g) {
+                        const screenPoint = view.toScreen(g.geometry);
+                        if (screenPoint) {
+                            const dx = screenPoint.x - event.x;
+                            const dy = screenPoint.y - event.y;
+                            const distance = Math.sqrt(dx * dx + dy * dy);
+
+                            if (distance < minDistance) {
+                                minDistance = distance;
+                                closestGraphic = g;
+                            }
+                        }
+                    });
+
+                    if (closestGraphic) {
+                        const attr = closestGraphic.attributes;
+                        view.popup.open({
+                            title: "📍 點位資訊",
+                            content: `
+                                <div style="font-size: 14px; line-height: 1.5;">
+                                    <b>標記編號:</b> ${attr.id}<br>
+                                    <b>X 座標:</b> ${attr.x}<br>
+                                    <b>Y 座標:</b> ${attr.y}<br>
+                                    <b>Z 高度:</b> <span style="color:red; font-weight:bold;">${attr.z}</span> 公尺
+                                </div>
+                            `,
+                            location: closestGraphic.geometry
+                        });
+                    }
+                }
+            });
+
+        });
+    </script>
+</body>
+</html>
