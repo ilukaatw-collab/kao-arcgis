@@ -100,9 +100,18 @@
             // 【新增】允許視角穿透地表，避免山坡地形碰撞卡頓與破面
             map.ground.navigationConstraint = { mode: "none" };
 
+            // 【修改】起始位置改為高雄甲仙區，並加入 Web Mercator 的空間參考設定
             const view = new SceneView({
                 container: "viewDiv", map: map,
-                camera: { position: { x: 120.68, y: 24.14, z: 2500 }, tilt: 60 }
+                camera: { 
+                    position: { 
+                        x: 13425515.36, 
+                        y: 2647768.52, 
+                        z: 2500,
+                        spatialReference: { wkid: 3857 }
+                    }, 
+                    tilt: 60 
+                }
             });
 
             view.popup.autoOpenEnabled = true;
